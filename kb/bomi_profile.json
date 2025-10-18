@@ -1,0 +1,91 @@
+{
+  "name": {
+    "full": "Bhornpat Klinkomut",
+    "nickname": "Bomi",
+    "given_at_birth": "Bow"
+  },
+  "personal": {
+    "age": 24,
+    "birthdate": "2000-09-18",
+    "pronouns": "she/her",
+    "mbti": "INFJ-INTJ"
+  },
+  "education": [
+    {
+      "level": "Nursery",
+      "school": "Wat Tri Phra Sri Maha Khet School",
+      "age_started": 2
+    },
+    {
+      "level": "Kindergarten 1-2",
+      "age_range": "3-4"
+    },
+    {
+      "level": "Kindergarten 3 to Grade 6",
+      "school": "Maephra Prajak School"
+    },
+    {
+      "level": "Grade 1 to Grade 6",
+      "school": "Kannasoot Suksalai School",
+      "program": "Science-Math"
+    },
+    {
+      "level": "University",
+      "school": "Srinakharinwirot University",
+      "program": "Language and Intercultural Communication",
+      "nickname": "SWU IC"
+    }
+  ],
+  "work_experience": [
+    {
+      "role": "Receptionist (Internship)",
+      "company": "AIRPORTELs Luggage Delivery & Storage"
+    },
+    {
+      "role": "Product Consultant (PC)",
+      "type": "Short-term"
+    },
+    {
+      "role": "Event Staff",
+      "type": "Short-term"
+    },
+    {
+      "role": "Graphic Designer",
+      "company": "A&A Lifestyle Company"
+    },
+    {
+      "role": "Programmer Full-stack",
+      "company": "Firstbiz solution"
+    }
+  ],
+  "interests": {
+    "activities": [
+      "watching YouTube",
+      "sleeping",
+      "cooking"
+    ],
+    "creative": [
+      "beauty",
+      "fashion",
+      "jewelry",
+      "makeup",
+      "dressing up"
+    ],
+    "academic": [
+      "science",
+      "psychology",
+      "philosophy",
+      "linguistics",
+      "mathematics",
+      "analytical thinking",
+      "coding",
+      "self-development"
+    ],
+    "topics_researched": [
+      "human behavior",
+      "human needs",
+      "philosophical theories",
+      "origin and meaning of life"
+    ]
+  }
+}

@@ -1,0 +1,36 @@
+# Python / virtual env
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+ENV/
+env/
+.python-version
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+.vs/
+
+# Caches and logs
+*.log
+hf_cache/
+.cache/
+
+# Generated artifacts
+tmp_audio/
+rag_index/
+memory/
+
+# Large data/models (store these outside Git or sync separately)
+models/
+checkpoints_v2/
+
+# Audio assets (keep directory, ignore heavy files)
+assets/*.wav
+assets/**/*.wav
+
