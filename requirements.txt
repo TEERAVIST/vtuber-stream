@@ -1,5 +1,5 @@
-numpy>=1.24
-scipy>=1.11
+numpy>=1.26,<2
+scipy>=1.12
 soundfile>=0.12
 transformers>=4.44
 accelerate>=0.33
@@ -8,11 +8,10 @@ sentencepiece>=0.1.99
 PyYAML>=6.0
 pypdf>=4.2
 nltk>=3.8
-faiss-cpu>=1.7.4.post2
+faiss-cpu>=1.7.4,<2
 safetensors>=0.4.3
 einops>=0.7.0
 
-# Core voice libs from source
-git+https://github.com/myshell-ai/OpenVoice.git@v2.0.0
-git+https://github.com/myshell-ai/MeloTTS.git@main
-
+# Note: Torch is provided by the RunPod PyTorch image. We intentionally do not
+# pin/install torch here to avoid huge downloads and CUDA mismatches.
+# If running outside that image, install torch that matches your CUDA.

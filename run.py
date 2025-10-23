@@ -3,7 +3,8 @@ import argparse, os, sys, queue, re, threading, time, json, math, glob
 from dataclasses import dataclass
 from typing import Generator, Optional, Tuple, List, Dict
 import numpy as np
-# sounddevice may be unavailable on servers (e.g., RunPod without audio devices)
+import nltk
+from nltk.tokenize import word_tokenize
 try:
     import sounddevice as sd  # type: ignore
 except Exception:
@@ -11,6 +12,8 @@ except Exception:
 import soundfile as sf
 from scipy.signal import resample_poly
 import torch
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer,
@@ -76,7 +79,7 @@ def verify_local_model_dir(path: str):
 
 @dataclass
 class LLMConfig:
-    model_name: str = "Qwen/Qwen3-4B"
+    model_name: str = "Qwen/Qwen3-0.6B"
     device_map: str = "auto"
     enable_thinking: bool = False
     max_new_tokens: int = 256
@@ -88,7 +91,7 @@ class LLMConfig:
 class SentenceChunker:
     def __init__(self, min_chars: int = 40):
         self.buf = []; self.min_chars = min_chars
-        self.re_end = re.compile(r'[\.!\?…]+["”\']?\s*$')
+        self.re_end = re.compile(r'[\.!\?…\n]+["”\']?\s*$')
     def push(self, piece: str) -> Optional[str]:
         self.buf.append(piece); s = "".join(self.buf)
         if len(s) >= self.min_chars and self.re_end.search(s):
@@ -194,10 +197,10 @@ class UserMemory:
 
     def relevant_facts(self, query: str, k: int = 6) -> List[str]:
         if not self.facts: return []
-        toks_q = set(re.findall(r"\w+", query.lower()))
+        toks_q = set(word_tokenize(query.lower()))
         scored=[]
         for fact in self.facts:
-            toks_f=set(re.findall(r"\w+", fact.lower()))
+            toks_f=set(word_tokenize(fact.lower()))
             score=len(toks_q & toks_f)
             scored.append((score,fact))
         scored.sort(key=lambda x:x[0], reverse=True)
@@ -293,39 +296,126 @@ class HFTextEmbedding:
             self.model = AutoModel.from_pretrained(model_name, local_files_only=local_only).to(device)
             self.model.eval()
             self.device = device
+            
+            # Performance optimizations
+            self._embedding_cache = {}  # Cache for embeddings
+            self._max_cache_size = 1000
+            self._executor = ThreadPoolExecutor(max_workers=2)  # For parallel processing
         except Exception as e:
             print(f"[ERROR] Failed to load embedding model from {model_name}: {e}")
             print("[ERROR] Please ensure the embedding model is downloaded and available at the specified path")
             print("[ERROR] You can download it using: git clone https://huggingface.co/BAAI/bge-small-en-v1.5")
             raise
+    
+    def _get_cache_key(self, text: str) -> str:
+        """Generate cache key for text"""
+        return hashlib.md5(text.encode()).hexdigest()
+    
     @torch.no_grad()
     def encode(self, texts:List[str], batch_size:int=16)->np.ndarray:
-        outs=[]
-        for i in range(0, len(texts), batch_size):
-            batch=texts[i:i+batch_size]
-            inputs=self.tok(batch, padding=True, truncation=True, max_length=512, return_tensors="pt").to(self.device)
-            out=self.model(**inputs)
-            # mean pooling
-            last=out.last_hidden_state  # [B, T, H]
-            mask=inputs["attention_mask"].unsqueeze(-1)
-            emb=(last*mask).sum(1)/mask.sum(1).clamp(min=1e-9)
-            emb = torch.nn.functional.normalize(emb, p=2, dim=1)
-            outs.append(emb.cpu().float().numpy())
-        return np.vstack(outs)
+        # Check cache first
+        cached_embeddings = []
+        uncached_texts = []
+        uncached_indices = []
+        
+        for i, text in enumerate(texts):
+            cache_key = self._get_cache_key(text)
+            if cache_key in self._embedding_cache:
+                cached_embeddings.append((i, self._embedding_cache[cache_key]))
+            else:
+                uncached_texts.append(text)
+                uncached_indices.append(i)
+        
+        # Process uncached texts
+        outs = []
+        if uncached_texts:
+            # Process in batches
+            for i in range(0, len(uncached_texts), batch_size):
+                batch = uncached_texts[i:i+batch_size]
+                inputs = self.tok(batch, padding=True, truncation=True, max_length=512, return_tensors="pt").to(self.device)
+                out = self.model(**inputs)
+                # mean pooling
+                last = out.last_hidden_state  # [B, T, H]
+                mask = inputs["attention_mask"].unsqueeze(-1)
+                emb = (last*mask).sum(1)/mask.sum(1).clamp(min=1e-9)
+                emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+                batch_embeddings = emb.cpu().float().numpy()
+                
+                # Update cache
+                for j, text in enumerate(batch):
+                    cache_key = self._get_cache_key(text)
+                    if len(self._embedding_cache) < self._max_cache_size:
+                        self._embedding_cache[cache_key] = batch_embeddings[j]
+                
+                outs.append(batch_embeddings)
+        
+        # Combine cached and new embeddings
+        all_embeddings = np.zeros((len(texts), outs[0].shape[1] if outs else cached_embeddings[0][1].shape[0]))
+        
+        # Fill in cached embeddings
+        for idx, emb in cached_embeddings:
+            all_embeddings[idx] = emb
+        
+        # Fill in new embeddings
+        if outs:
+            new_embeddings = np.vstack(outs)
+            for i, idx in enumerate(uncached_indices):
+                all_embeddings[idx] = new_embeddings[i]
+        
+        return all_embeddings
 
 class CrossEncoderReranker:
     def __init__(self, model_name:str, device:str="cpu", local_only:bool=True):
         self.tok=AutoTokenizer.from_pretrained(model_name, local_files_only=local_only)
         self.model=AutoModelForSequenceClassification.from_pretrained(model_name, local_files_only=local_only).to(device)
         self.model.eval(); self.device=device
+        
+        # Performance optimizations
+        self._score_cache = {}  # Cache for reranking scores
+        self._max_cache_size = 500
+    
+    def _get_cache_key(self, query: str, passage: str) -> str:
+        """Generate cache key for query-passage pair"""
+        combined = f"{query.lower().strip()}|||{passage.lower().strip()}"
+        return hashlib.md5(combined.encode()).hexdigest()
+    
     @torch.no_grad()
     def score(self, query:str, passages:List[str], batch_size:int=8)->List[float]:
-        scores=[]
-        for i in range(0,len(passages), batch_size):
-            batch=passages[i:i+batch_size]
-            enc=self.tok([ (query, p) for p in batch ], padding=True, truncation=True, return_tensors="pt", max_length=512).to(self.device)
-            logits=self.model(**enc).logits.squeeze(-1)
-            scores+=logits.detach().cpu().float().tolist()
+        # Check cache first
+        cached_scores = {}
+        uncached_passages = []
+        uncached_indices = []
+        
+        for i, passage in enumerate(passages):
+            cache_key = self._get_cache_key(query, passage)
+            if cache_key in self._score_cache:
+                cached_scores[i] = self._score_cache[cache_key]
+            else:
+                uncached_passages.append(passage)
+                uncached_indices.append(i)
+        
+        # Process uncached passages
+        scores = [0.0] * len(passages)
+        
+        # Fill in cached scores
+        for idx, score in cached_scores.items():
+            scores[idx] = score
+        
+        # Process uncached passages in batches
+        if uncached_passages:
+            for i in range(0, len(uncached_passages), batch_size):
+                batch = uncached_passages[i:i+batch_size]
+                enc = self.tok([ (query, p) for p in batch ], padding=True, truncation=True, return_tensors="pt", max_length=512).to(self.device)
+                logits = self.model(**enc).logits.squeeze(-1)
+                batch_scores = logits.detach().cpu().float().tolist()
+                
+                # Update cache and scores
+                for j, passage in enumerate(batch):
+                    cache_key = self._get_cache_key(query, passage)
+                    if len(self._score_cache) < self._max_cache_size:
+                        self._score_cache[cache_key] = batch_scores[j]
+                    scores[uncached_indices[i+j]] = batch_scores[j]
+        
         return scores
 
 class VectorStore:
@@ -337,19 +427,37 @@ class VectorStore:
             self.index = faiss.IndexFlatIP(dim)
         else:
             self.index=None
+        # Cache for embeddings to avoid repeated disk reads
+        self._embeddings_cache = None
+        self._cache_loaded = False
+    
     def add(self, X:np.ndarray):
         X = X.astype(np.float32)
         if self.use_faiss:
             self.index.add(X)
         else:
             self.emb = X if self.emb is None else np.vstack([self.emb, X])
+        # Update cache when adding embeddings
+        self._embeddings_cache = X
+        self._cache_loaded = True
+    
+    def get_embeddings(self, embeddings_path: Optional[str] = None) -> np.ndarray:
+        """Get embeddings with caching to avoid repeated disk reads"""
+        if self.use_faiss and embeddings_path and not self._cache_loaded:
+            self._embeddings_cache = np.load(embeddings_path)
+            self._cache_loaded = True
+        return self._embeddings_cache if self._embeddings_cache is not None else self.emb
+    
     def search(self, q:np.ndarray, topk:int=8)->Tuple[np.ndarray, np.ndarray]:
         q = q.astype(np.float32)
         if self.use_faiss:
             D,I = self.index.search(q, topk)
             return D,I
         # brute force cosine (dot because normalized)
-        sims = self.emb @ q[0]
+        embeddings = self.emb if self.emb is not None else self._embeddings_cache
+        if embeddings is None:
+            return np.array([]).reshape(1, 0), np.array([]).reshape(1, 0).astype(int)
+        sims = embeddings @ q[0]
         idx = np.argsort(-sims)[:topk]
         return sims[idx][None, :], idx[None, :]
 
@@ -368,6 +476,8 @@ class RAGPipeline:
         self.doc_texts: List[str]=[]
         self.doc_meta: List[Dict]=[]
         self.store: Optional[VectorStore]=None
+        self._docs_cache = None  # Cache for docs.jsonl
+        self._query_cache = {}   # Cache for query embeddings
 
     def _scan_files(self)->List[str]:
         exts = ["*.md","*.txt","*.json","*.jsonl","*.yaml","*.yml"]
@@ -412,7 +522,7 @@ class RAGPipeline:
             chunks=chunk_text(txt, self.tokenizer, self.target_tokens, self.overlap)
             title=os.path.basename(path)
             for i, ch in enumerate(chunks):
-                records.append({"path": path, "title": title, "chunk_id": i, "chars": len(ch)})
+                records.append({"path": path, "title": title, "chunk_id": i, "chars": len(ch), "text": ch})
                 texts.append(ch)
         if not texts:
             print("[RAG] No documents found."); texts=[]; records=[]
@@ -434,52 +544,85 @@ class RAGPipeline:
     def retrieve(self, query:str, topk:int=8, mmr_lambda:float=0.5)->List[Dict]:
         if self.store is None or (self.store.use_faiss and (self.store.index is None)):
             return []
-        q_emb=self.embed.encode([query])
+        
+        # Check cache for query embedding
+        query_hash = hash(query.lower().strip())
+        if query_hash in self._query_cache:
+            q_emb = self._query_cache[query_hash]
+        else:
+            q_emb = self.embed.encode([query])
+            # Limit cache size to prevent memory issues
+            if len(self._query_cache) > 100:
+                # Remove oldest entries (simple FIFO)
+                oldest_key = next(iter(self._query_cache))
+                del self._query_cache[oldest_key]
+            self._query_cache[query_hash] = q_emb
         D,I=self.store.search(q_emb, topk=topk*3)  # oversample before MMR
         I=I[0].tolist(); sims=D[0].tolist()
-        # load texts lazily
-        X = self.store.emb if not self.store.use_faiss else np.load(os.path.join(self.index_dir,"embeddings.npy"))
-        # MMR diversity
+        
+        # Get embeddings from cache to avoid repeated disk reads
+        embeddings_path = os.path.join(self.index_dir,"embeddings.npy") if self.store.use_faiss else None
+        X = self.store.get_embeddings(embeddings_path)
+        
+        # MMR diversity optimization - reduce computational complexity
         selected=[]
         cand=set(I)
         if not len(cand): return []
+        
         q = q_emb[0]
         # precompute sims for all candidates
         cand_list=list(cand)
         cand_vecs=X[cand_list]
         cand_sims = cand_vecs @ q
-        selected_idx=[]
-        # pick best first
-        best = int(cand_list[int(np.argmax(cand_sims))])
-        selected_idx.append(best)
+        
+        # Pick the best first
+        best_idx = np.argmax(cand_sims)
+        best = int(cand_list[best_idx])
+        selected_idx=[best]
         cand.remove(best)
+        
+        # Optimize MMR calculation
         while len(selected_idx) < min(topk, len(cand_list)):
             best_score=-1e9; best_id=None
-            for cid in list(cand):
-                # relevance
-                rel = (X[cid] @ q)
-                # diversity: max sim to already selected
-                if selected_idx:
-                    div = max([X[cid] @ X[j] for j in selected_idx])
-                else:
-                    div = 0.0
-                score = mmr_lambda*rel - (1-mmr_lambda)*div
-                if score>best_score:
-                    best_score=score; best_id=cid
-            selected_idx.append(best_id); cand.remove(best_id)
-        # prepare out
+            
+            # Vectorized computation for relevance scores
+            remaining_cands = list(cand)
+            if not remaining_cands:
+                break
+                
+            # Batch compute relevance scores
+            rel_scores = np.array([X[cid] @ q for cid in remaining_cands])
+            
+            # Batch compute diversity scores
+            if selected_idx:
+                # Vectorized diversity computation
+                selected_vecs = X[selected_idx]
+                remaining_vecs = X[remaining_cands]
+                # Compute max similarity to selected items for each candidate
+                div_matrix = remaining_vecs @ selected_vecs.T
+                div_scores = np.max(div_matrix, axis=1)
+            else:
+                div_scores = np.zeros(len(remaining_cands))
+            
+            # Calculate final scores
+            scores = mmr_lambda * rel_scores - (1 - mmr_lambda) * div_scores
+            best_local_idx = np.argmax(scores)
+            best_id = remaining_cands[best_local_idx]
+            
+            selected_idx.append(best_id)
+            cand.remove(best_id)
+        
+        # Cache docs.jsonl to avoid repeated file reads
+        if not hasattr(self, '_docs_cache') or self._docs_cache is None:
+            docs_path = os.path.join(self.index_dir,"docs.jsonl")
+            with open(docs_path,"r",encoding="utf-8") as f:
+                self._docs_cache = [json.loads(ln) for ln in f]
+        
+        # Prepare output
         out=[]
-        # read docs.jsonl
-        docs=[]
-        with open(os.path.join(self.index_dir,"docs.jsonl"),"r",encoding="utf-8") as f:
-            docs=[json.loads(ln) for ln in f]
-        # we need original chunk texts; regenerate from file to avoid storing big text
         for rank, idx in enumerate(selected_idx, start=1):
-            meta=docs[idx]
-            text=read_text_from_file(meta["path"])
-            # reconstruct chunk
-            chunks=chunk_text(text, self.tokenizer, self.target_tokens, self.overlap)
-            chunk_text_str = chunks[meta["chunk_id"]] if meta["chunk_id"] < len(chunks) else ""
+            meta=self._docs_cache[idx]
+            chunk_text_str = meta.get("text", "")
             out.append({"rank":rank, "score": float(X[idx] @ q), "title": meta["title"], "path": meta["path"], "chunk": chunk_text_str})
         return out
 
@@ -526,7 +669,7 @@ def format_knowledge_context(items:List[Dict], max_chars:int=2400)->str:
     )
     return f"[KNOWLEDGE CONTEXT]\n{guide}\n\n{ctx}"
 
-# ------------------ TTS: OpenVoice V2 Wrapper (unchanged) ------------------
+# ------------------ TTS: OpenVoice V2 Wrapper (optimized) ------------------
 class OpenVoiceV2:
     def __init__(self, ckpt_root: str, device: str, language: str,
                  base_speaker_key: str, ref_wav: str, out_sr: int, speed: float=1.0):
@@ -553,9 +696,19 @@ class OpenVoiceV2:
             self.target_se = self.source_se
         else:
             self.target_se, _ = se_extractor.get_se(ref_wav, self.converter, target_dir=self.tmp_dir, vad=True)
+        
+        # Performance optimizations
+        self._audio_cache = {}  # Cache for generated audio
+        self._max_cache_size = 50  # Limit cache size
 
     def set_base_speaker(self, base_speaker_key: str):
-        spk_keys = self.melo.hps.data.spk2id
+        # Handle potential attribute access issues
+        try:
+            spk_keys = getattr(self.melo.hps.data, 'spk2id', {})
+        except AttributeError:
+            # Fallback for different melo TTS versions
+            spk_keys = getattr(self.melo.hps, 'spk2id', {})
+            
         if base_speaker_key not in spk_keys:
             raise ValueError(f"'{base_speaker_key}' ไม่อยู่ในรายชื่อ speaker: {list(spk_keys.keys())}")
         self.base_speaker_key = base_speaker_key
@@ -569,51 +722,134 @@ class OpenVoiceV2:
     def set_speed(self, speed: float):
         self.speed = max(0.6, min(1.4, float(speed)))
 
-    def tts_and_convert(self, text: str) -> Tuple[np.ndarray, int]:
-        tmp_src = os.path.join(self.tmp_dir, f"base_{time.time_ns()}.wav")
-        self.melo.tts_to_file(text, self.speaker_id, tmp_src, speed=self.speed)
-        out_path = os.path.join(self.tmp_dir, f"ovc_{time.time_ns()}.wav")
-        self.converter.convert(
-            audio_src_path=tmp_src, src_se=self.source_se, tgt_se=self.target_se,
-            output_path=out_path, message="@MyShell"
-        )
-        audio, sr = sf.read(out_path, dtype="float32", always_2d=False)
-        if audio.ndim > 1: audio = audio.mean(axis=1)
-        audio = ensure_sr(audio, sr, self.out_sr)
-        return audio, self.out_sr
+    def _get_cache_key(self, text: str) -> str:
+        """Generate cache key for text"""
+        return f"{hash(text.lower().strip())}_{self.speed}_{self.base_speaker_key}"
 
-# ------------------ Audio player (unchanged) ------------------
+    def tts_and_convert(self, text: str) -> Tuple[np.ndarray, int]:
+        # Check cache first
+        cache_key = self._get_cache_key(text)
+        if cache_key in self._audio_cache:
+            return self._audio_cache[cache_key]
+        
+        # Generate temporary file names with process ID to avoid conflicts
+        pid = os.getpid()
+        timestamp = int(time.time_ns() / 1_000_000)  # Milliseconds
+        tmp_src = os.path.join(self.tmp_dir, f"base_{pid}_{timestamp}.wav")
+        out_path = os.path.join(self.tmp_dir, f"ovc_{pid}_{timestamp}.wav")
+        
+        try:
+            # Generate TTS
+            self.melo.tts_to_file(text, self.speaker_id, tmp_src, speed=self.speed)
+            
+            # Convert voice
+            self.converter.convert(
+                audio_src_path=tmp_src, src_se=self.source_se, tgt_se=self.target_se,
+                output_path=out_path, message="@MyShell"
+            )
+            
+            # Load and process audio
+            audio, sr = sf.read(out_path, dtype="float32", always_2d=False)
+            if audio.ndim > 1: audio = audio.mean(axis=1)
+            audio = ensure_sr(audio, sr, self.out_sr)
+            
+            # Update cache with size limit
+            if len(self._audio_cache) < self._max_cache_size:
+                self._audio_cache[cache_key] = (audio, self.out_sr)
+            
+            return audio, self.out_sr
+        finally:
+            # Clean up temporary files
+            for path in [tmp_src, out_path]:
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except Exception:
+                    pass  # Ignore cleanup errors
+
+# ------------------ Audio player (optimized) ------------------
 class AudioPlayer(threading.Thread):
-    """Background audio sink.
+    """Background audio sink with batch processing support.
 
     - If sounddevice is available and headless=False → play audio.
     - Otherwise (no sound device or headless=True) → save wav files to tmp_audio/ and print path.
     """
     def __init__(self, out_sr: int = 48000, headless: bool = False, out_dir: str = "tmp_audio"):
         super().__init__(daemon=True)
-        self.q: "queue.Queue[Tuple[np.ndarray,int]]" = queue.Queue(maxsize=32)
+        self.q: "queue.Queue[Tuple[np.ndarray,int]]" = queue.Queue(maxsize=64)  # Increased queue size
         self.out_sr = out_sr; self._stop = threading.Event()
         self.headless = headless or (sd is None)
         self.out_dir = out_dir
         os.makedirs(self.out_dir, exist_ok=True)
-    def enqueue(self, audio: np.ndarray, sr: int): self.q.put((audio, sr))
-    def run(self):
-        while not self._stop.is_set():
-            try: audio, sr = self.q.get(timeout=0.1)
-            except queue.Empty: continue
-            audio = ensure_sr(audio, sr, self.out_sr)
-            if self.headless:
-                # save to file instead of playing
-                ts = time.strftime("%Y%m%d-%H%M%S")
-                out_path = os.path.join(self.out_dir, f"segment-{ts}-{time.time_ns()%1_000_000}.wav")
+        
+        # Batch processing for better performance
+        self._batch_size = 3
+        self._batch = []
+        self._batch_lock = threading.Lock()
+        self._batch_event = threading.Event()
+        
+    def enqueue(self, audio: np.ndarray, sr: int):
+        self.q.put((audio, sr))
+        
+    def _process_batch(self, batch: List[Tuple[np.ndarray, int]]):
+        """Process a batch of audio segments together"""
+        if not batch:
+            return
+            
+        if self.headless:
+            # Save to files in batch
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            for i, (audio, sr) in enumerate(batch):
+                audio = ensure_sr(audio, sr, self.out_sr)
+                out_path = os.path.join(self.out_dir, f"segment-{ts}-{i}-{time.time_ns()%1_000_000}.wav")
                 try:
                     sf.write(out_path, audio, self.out_sr)
                     print(f" [audio→{out_path}] ", end="", flush=True)
                 except Exception as e:
                     print(f" [audio-save-failed: {e}] ", end="", flush=True)
-            else:
-                sd.play(audio, self.out_sr, blocking=True)
-            self.q.task_done()
+        else:
+            # Play audio sequentially with minimal gaps
+            for audio, sr in batch:
+                if sd is not None:
+                    audio = ensure_sr(audio, sr, self.out_sr)
+                    sd.play(audio, self.out_sr, blocking=True)
+    
+    def run(self):
+        while not self._stop.is_set():
+            batch = []
+            
+            # Collect a batch or wait for timeout
+            deadline = time.time() + 0.2  # 200ms timeout
+            while len(batch) < self._batch_size and time.time() < deadline:
+                try:
+                    timeout = max(0.01, deadline - time.time())
+                    audio, sr = self.q.get(timeout=timeout)
+                    batch.append((audio, sr))
+                    self.q.task_done()
+                except queue.Empty:
+                    continue
+            
+            # Process the batch if we have items
+            if batch:
+                self._process_batch(batch)
+            
+            # Check if we should stop
+            if self._stop.is_set():
+                break
+        
+        # Process any remaining items in the queue
+        remaining = []
+        try:
+            while True:
+                audio, sr = self.q.get_nowait()
+                remaining.append((audio, sr))
+                self.q.task_done()
+        except queue.Empty:
+            pass
+        
+        if remaining:
+            self._process_batch(remaining)
+    
     def stop(self):
         self._stop.set()
         try:
@@ -634,8 +870,48 @@ class ChatLLM:
         self.rag = rag
         self.reranker = reranker
         self.rag_enabled = rag is not None
+        
+        # Cache for token counts to avoid repeated tokenization
+        self._token_cache = {}
+        self._max_cache_size = 1000
+        
+        # Optimize tokenizer loading
         self.tok = AutoTokenizer.from_pretrained(cfg.model_name, use_fast=True, local_files_only=LOCAL_ONLY)
-        self.model = AutoModelForCausalLM.from_pretrained(cfg.model_name, device_map=cfg.device_map, dtype="auto", local_files_only=LOCAL_ONLY)
+        if self.tok.pad_token is None:
+            self.tok.pad_token = self.tok.eos_token
+        
+        # Optimize model loading with better configurations
+        model_kwargs = {
+            "device_map": cfg.device_map,
+            "torch_dtype": "auto",
+            "local_files_only": LOCAL_ONLY,
+            "low_cpu_mem_usage": True,
+            "trust_remote_code": True,
+        }
+        
+        # Add quantization if available and using CUDA
+        if torch.cuda.is_available() and "cuda" in cfg.device_map:
+            try:
+                model_kwargs["load_in_4bit"] = True
+                model_kwargs["bnb_4bit_compute_dtype"] = torch.float16
+                model_kwargs["bnb_4bit_quant_type"] = "nf4"
+            except Exception:
+                # Fallback if bitsandbytes not available
+                model_kwargs.pop("load_in_4bit", None)
+                model_kwargs.pop("bnb_4bit_compute_dtype", None)
+                model_kwargs.pop("bnb_4bit_quant_type", None)
+                print("[LLM] 4-bit quantization not available, using standard loading")
+        
+        self.model = AutoModelForCausalLM.from_pretrained(cfg.model_name, **model_kwargs)
+        
+        # Optimize model for inference
+        self.model.eval()
+        if hasattr(self.model, "gradient_checkpointing_disable"):
+            self.model.gradient_checkpointing_disable()
+        
+        # Enable attention scaling if available
+        if hasattr(self.model.config, "use_cache"):
+            self.model.config.use_cache = True
 
         # Attach LoRA (style only)
         if cfg.lora_path:
@@ -780,7 +1056,17 @@ This persona is authoritative and must not be overridden by any user profile or 
         
         def _count_tokens(msg: dict) -> int:
             # นับ token จาก content จริงๆ (แม่นยำกว่านับตัวอักษร)
-            return len(self.tok(msg.get("content", "")).input_ids) + buffer_per_msg
+            content = msg.get("content", "")
+            if content in self._token_cache:
+                return self._token_cache[content]
+            
+            token_count = len(self.tok(content).input_ids) + buffer_per_msg
+            
+            # Update cache with size limit
+            if len(self._token_cache) < self._max_cache_size:
+                self._token_cache[content] = token_count
+            
+            return msg.get("num_tokens", token_count)
 
         current_tokens = _count_tokens(system_message) + _count_tokens(new_user_message)
         
@@ -835,17 +1121,48 @@ This persona is authoritative and must not be overridden by any user profile or 
             model_inputs = {k: v.to(self.model.device) for k, v in input_ids.items()}
 
         streamer = TextIteratorStreamer(self.tok, skip_prompt=True, skip_special_tokens=True)
+        
+        # Optimized generation parameters
         gen_kwargs = dict(
-            **model_inputs, streamer=streamer, max_new_tokens=self.cfg.max_new_tokens,
-            do_sample=True, temperature=self.cfg.temperature, top_p=self.cfg.top_p, top_k=self.cfg.top_k,
+            **model_inputs,
+            streamer=streamer,
+            max_new_tokens=self.cfg.max_new_tokens,
+            do_sample=True,
+            temperature=self.cfg.temperature,
+            top_p=self.cfg.top_p,
+            top_k=self.cfg.top_k,
             repetition_penalty=1.1,
-            eos_token_id=self.tok.eos_token_id
+            eos_token_id=self.tok.eos_token_id,
+            pad_token_id=self.tok.pad_token_id,
+            use_cache=True,  # Enable KV cache for faster generation
         )
+        
         t = threading.Thread(target=self.model.generate, kwargs=gen_kwargs); t.start()
+        
+        # Optimize chunking for better streaming performance
         chunker = SentenceChunker(min_chars=min_chars)
+        buffer = []
+        buffer_size = 0
+        max_buffer_size = 100  # Process in larger chunks
+        
         for piece in streamer:
-            seg = chunker.push(piece)
+            buffer.append(piece)
+            buffer_size += len(piece)
+            
+            if buffer_size >= max_buffer_size:
+                combined = "".join(buffer)
+                seg = chunker.push(combined)
+                if seg:
+                    yield seg
+                buffer = []
+                buffer_size = 0
+        
+        # Process remaining buffer
+        if buffer:
+            combined = "".join(buffer)
+            seg = chunker.push(combined)
             if seg: yield seg
+            
         tail = chunker.flush()
         if tail: yield tail
         t.join()
@@ -1037,27 +1354,49 @@ def main():
                 else:
                     print("• คำสั่งไม่รู้จัก ใช้ /help ดูตัวเลือก"); continue
 
-            # Chat turn
+            # Chat turn with parallel processing
             print("Assistant: ", end="", flush=True)
             full_reply=[]
-            # ป้อนพารามิเตอร์ RAG เข้า stream_reply
-            for seg in brain.stream_reply(
-                user_text,
-                min_chars=args.min_chars,
-                topk=args.top_k if rag_on else 0,
-                mmr_lambda=args.mmr_lambda,
-                rerank_k=min(args.rerank_k, args.top_k)
-            ):
-                print(seg, end=" ", flush=True)
-                full_reply.append(seg)
-                # สังเคราะห์เสียงตามประโยค
-                audio, sr = ov.tts_and_convert(seg)
-                player.enqueue(audio, sr)
+            
+            # Use parallel processing for TTS and text generation
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                # ป้อนพารามิเตอร์ RAG เข้า stream_reply
+                for seg in brain.stream_reply(
+                    user_text,
+                    min_chars=args.min_chars,
+                    topk=args.top_k if rag_on else 0,
+                    mmr_lambda=args.mmr_lambda,
+                    rerank_k=min(args.rerank_k, args.top_k)
+                ):
+                    print(seg, end=" ", flush=True)
+                    full_reply.append(seg)
+                    
+                    # Submit TTS task to thread pool for parallel processing
+                    future = executor.submit(ov.tts_and_convert, seg)
+                    # Store future for later retrieval
+                    if not hasattr(player, '_audio_futures'):
+                        player._audio_futures = []
+                    player._audio_futures.append(future)
+                
+                # Process completed TTS tasks
+                if hasattr(player, '_audio_futures'):
+                    for future in as_completed(player._audio_futures):
+                        try:
+                            audio, sr = future.result()
+                            player.enqueue(audio, sr)
+                        except Exception as e:
+                            print(f"[TTS Error] {e}", flush=True)
+                    player._audio_futures.clear()
 
             print()
             assistant_text=" ".join(full_reply).strip()
-            brain.history.append({"role":"user","content": user_text})
-            brain.history.append({"role":"assistant","content": assistant_text})
+
+            # Optimize token counting with caching
+            user_tok_count = len(brain.tok(user_text).input_ids)
+            asst_tok_count = len(brain.tok(assistant_text).input_ids)
+
+            brain.history.append({"role":"user","content": user_text, "num_tokens": user_tok_count + 10}) # +10 คือ buffer
+            brain.history.append({"role":"assistant","content": assistant_text, "num_tokens": asst_tok_count + 10})
 
     finally:
         player.stop()

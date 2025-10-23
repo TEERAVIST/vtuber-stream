@@ -49,6 +49,10 @@ EMBED_DIR="$PROJECT_DIR/models/embeds/bge-small-en-v1.5"
 RERANK_DIR="$PROJECT_DIR/models/reranker/bge-reranker-base"
 REF_WAV="$PROJECT_DIR/assets/voice_ref.wav"
 
+# Install core voice libs without pulling their pinned deps (avoid old numpy)
+pip install --no-deps --no-cache-dir git+https://github.com/myshell-ai/OpenVoice.git
+pip install --no-deps --no-cache-dir git+https://github.com/myshell-ai/MeloTTS.git
+
 # Auto-fetch OpenVoice V2 checkpoints if missing
 if [ ! -f "$PROJECT_DIR/checkpoints_v2/checkpoints_v2/converter/checkpoint.pth" ]; then
   echo "[SETUP] Fetching OpenVoiceV2 converter + base speakers …"
