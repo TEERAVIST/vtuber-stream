@@ -79,7 +79,7 @@ def verify_local_model_dir(path: str):
 
 @dataclass
 class LLMConfig:
-    model_name: str = "Qwen/Qwen3-0.6B"
+    model_name: str = "Qwen/Qwen3-14B"
     device_map: str = "auto"
     enable_thinking: bool = False
     max_new_tokens: int = 256
