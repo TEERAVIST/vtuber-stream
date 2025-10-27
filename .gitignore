@@ -34,3 +34,4 @@ checkpoints_v2/
 assets/*.wav
 assets/**/*.wav
 
+nltk_data
