@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VTuber Audio Stream Client (ngrok)</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        .connected {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .connecting {
+            background-color: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeeba;
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin: 20px 0;
+        }
+        input {
+            flex: 1;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        button {
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+        }
+        .audio-info {
+            margin: 10px 0;
+            padding: 10px;
+            background-color: #e9ecef;
+            border-radius: 5px;
+        }
+        .log {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 5px;
+            height: 200px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .instructions {
+            background-color: #e7f3ff;
+            border: 1px solid #b3d9ff;
+            border-radius: 5px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>VTuber Audio Stream Client (ngrok)</h1>
+        
+        <div class="instructions">
+            <h3>Instructions:</h3>
+            <ol>
+                <li>Run the server with: <code>./run_with_ngrok.sh</code></li>
+                <li>Copy the ngrok URL from the server output</li>
+                <li>Paste it below (change http:// to wss://)</li>
+                <li>Click Connect</li>
+            </ol>
+            <p><strong>Example:</strong> If server shows <code>https://abc123.ngrok-free.app</code>, enter <code>wss://abc123.ngrok-free.app</code></p>
+        </div>
+        
+        <div id="status" class="status disconnected">Disconnected</div>
+        
+        <div class="controls">
+            <input type="text" id="serverUrl" placeholder="wss://abc123.ngrok-free.app" value="">
+            <button id="connectBtn">Connect</button>
+            <button id="disconnectBtn" disabled>Disconnect</button>
+        </div>
+        
+        <div class="audio-info">
+            <div>Current Audio: <span id="currentAudio">None</span></div>
+            <div>Audio Count: <span id="audioCount">0</span></div>
+        </div>
+        
+        <div class="log" id="log"></div>
+    </div>
+
+    <script>
+        let socket = null;
+        let audioContext = null;
+        let audioCount = 0;
+
+        const statusEl = document.getElementById('status');
+        const connectBtn = document.getElementById('connectBtn');
+        const disconnectBtn = document.getElementById('disconnectBtn');
+        const serverUrlEl = document.getElementById('serverUrl');
+        const currentAudioEl = document.getElementById('currentAudio');
+        const audioCountEl = document.getElementById('audioCount');
+        const logEl = document.getElementById('log');
+
+        function log(message) {
+            const time = new Date().toLocaleTimeString();
+            logEl.innerHTML += `[${time}] ${message}\n`;
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        function updateStatus(status, className) {
+            statusEl.textContent = status;
+            statusEl.className = `status ${className}`;
+        }
+
+        function playAudio(audioData, filename) {
+            try {
+                // Convert base64 to binary
+                const binaryString = atob(audioData);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+
+                // Create audio context if needed
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
+
+                // Decode and play the audio
+                audioContext.decodeAudioData(bytes.buffer, function(buffer) {
+                    const source = audioContext.createBufferSource();
+                    source.buffer = buffer;
+                    source.connect(audioContext.destination);
+                    source.onended = function() {
+                        log(`Finished playing: ${filename}`);
+                    };
+                    source.start(0);
+                    
+                    currentAudioEl.textContent = filename;
+                    audioCount++;
+                    audioCountEl.textContent = audioCount;
+                    log(`Playing: ${filename}`);
+                });
+            } catch (error) {
+                log(`Error playing audio: ${error.message}`);
+            }
+        }
+
+        function connect() {
+            let url = serverUrlEl.value.trim();
+            if (!url) {
+                log('Please enter a server URL');
+                return;
+            }
+
+            // Auto-convert http:// to ws:// and https:// to wss://
+            if (url.startsWith('http://')) {
+                url = url.replace('http://', 'ws://');
+            } else if (url.startsWith('https://')) {
+                url = url.replace('https://', 'wss://');
+            }
+
+            // Ensure it starts with ws:// or wss://
+            if (!url.startsWith('ws://') && !url.startsWith('wss://')) {
+                log('URL must start with ws:// or wss://');
+                return;
+            }
+
+            updateStatus('Connecting...', 'connecting');
+            connectBtn.disabled = true;
+            
+            try {
+                socket = new WebSocket(url);
+                
+                socket.onopen = function() {
+                    updateStatus(`Connected to ${url}`, 'connected');
+                    disconnectBtn.disabled = false;
+                    log(`Connected to server: ${url}`);
+                };
+                
+                socket.onmessage = function(event) {
+                    try {
+                        const message = JSON.parse(event.data);
+                        if (message.type === 'audio') {
+                            log(`Received audio: ${message.filename}`);
+                            playAudio(message.data, message.filename);
+                        }
+                    } catch (error) {
+                        log(`Error processing message: ${error.message}`);
+                    }
+                };
+                
+                socket.onclose = function() {
+                    updateStatus('Disconnected', 'disconnected');
+                    connectBtn.disabled = false;
+                    disconnectBtn.disabled = true;
+                    log('Connection closed');
+                };
+                
+                socket.onerror = function(error) {
+                    log(`WebSocket error: ${error}`);
+                    updateStatus('Connection error', 'disconnected');
+                    connectBtn.disabled = false;
+                    disconnectBtn.disabled = true;
+                };
+            } catch (error) {
+                log(`Error connecting: ${error.message}`);
+                updateStatus('Connection failed', 'disconnected');
+                connectBtn.disabled = false;
+            }
+        }
+
+        function disconnect() {
+            if (socket) {
+                socket.close();
+                socket = null;
+            }
+        }
+
+        connectBtn.addEventListener('click', connect);
+        disconnectBtn.addEventListener('click', disconnect);
+
+        // Allow Enter key to connect
+        serverUrlEl.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                connect();
+            }
+        });
+
+        log('Audio stream client ready (ngrok version)');
+    </script>
+</body>
+</html>
